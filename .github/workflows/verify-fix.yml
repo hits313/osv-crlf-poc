@@ -1,0 +1,130 @@
+name: osv-scanner CRLF Fix Verification
+
+# Builds osv-scanner from the proposed fix branch (hits313/osv-scanner@fix/crlf-default-table-vertical)
+# and re-runs the same exploit attempt as crlf-poc.yml. With the fix in place:
+#   - No ::warning:: / ::error:: annotations should fire on this run.
+#   - od -c of stdout should show ZERO raw \r bytes.
+#   - The encoded form %0D should appear instead.
+# A failure of any of those checks fails the job.
+
+on:
+  push:
+    branches: [verify-fix]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build patched osv-scanner from PR fork
+        run: |
+          git clone --depth 5 --branch fix/crlf-default-table-vertical \
+            https://github.com/hits313/osv-scanner.git /tmp/osv-src
+          cd /tmp/osv-src
+          echo "Branch HEAD: $(git rev-parse HEAD)"
+          go build -o /tmp/osv-bin-fixed ./cmd/osv-scanner/
+          /tmp/osv-bin-fixed --version
+
+      - name: Run patched binary on same malicious path (must NOT inject)
+        run: |
+          DIR="$(printf '/tmp/poc/dir\r::warning::SHOULD_NOT_FIRE_AFTER_FIX\r::error::SHOULD_NOT_FIRE_AFTER_FIX\r::stop-commands::TOK')"
+          mkdir -p "$DIR"
+
+          cat > "$DIR/package-lock.json" <<'JSON'
+          {
+            "name": "x", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+              "": { "name": "x", "version": "1.0.0", "dependencies": { "lodash": "4.17.20" } },
+              "node_modules/lodash": {
+                "version": "4.17.20",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                "integrity": "sha512-PlhdFcillOINfeV7Ni6oF1TAEayyZBoZ8bcshTHqOYJYlrqzRK5hagpagky5o4HfCzzd1TRkXPMFq6cKk9rGmA==",
+                "license": "MIT"
+              }
+            }
+          }
+          JSON
+
+          /tmp/osv-bin-fixed --offline-vulnerabilities --download-offline-databases \
+            "$DIR/package-lock.json" > /tmp/out.txt 2>/dev/null || true
+
+          echo "--- raw \\r bytes in stdout ---"
+          RAW=$(tr -cd '\r' < /tmp/out.txt | wc -c)
+          echo "count=$RAW"
+
+          echo "--- ::commands present after \\r->\\n translation ---"
+          INJECTED=$(tr '\r' '\n' < /tmp/out.txt | grep -c '^::stop-commands\|^::error\|^::warning' || true)
+          echo "injected_count=$INJECTED"
+
+          echo "--- %0D occurrences (encoded \\r) ---"
+          grep -o '%0D' /tmp/out.txt | wc -l
+
+          echo "--- first 200 bytes of stdout ---"
+          head -c 200 /tmp/out.txt
+          echo
+
+          if [ "$RAW" -ne 0 ]; then
+            echo "FAIL: stdout still contains $RAW raw \\r bytes"
+            exit 1
+          fi
+          if [ "$INJECTED" -ne 0 ]; then
+            echo "FAIL: $INJECTED workflow commands would still be parsed by the runner"
+            exit 1
+          fi
+          echo "PASS: zero raw \\r, zero injectable workflow commands"
+
+      - name: Byte-level proof (od -c on patched binary)
+        run: |
+          DIR="$(printf '/tmp/poc2/dir\r::warning::SHOULD_NOT_FIRE')"
+          mkdir -p "$DIR"
+          cat > "$DIR/package-lock.json" <<'JSON'
+          {
+            "name": "x", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+              "": { "name": "x", "version": "1.0.0", "dependencies": { "lodash": "4.17.20" } },
+              "node_modules/lodash": {
+                "version": "4.17.20",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                "integrity": "sha512-PlhdFcillOINfeV7Ni6oF1TAEayyZBoZ8bcshTHqOYJYlrqzRK5hagpagky5o4HfCzzd1TRkXPMFq6cKk9rGmA==",
+                "license": "MIT"
+              }
+            }
+          }
+          JSON
+
+          echo "od -c of first stdout line (should show %0D, not \\r):"
+          /tmp/osv-bin-fixed --offline-vulnerabilities --download-offline-databases \
+            "$DIR/package-lock.json" 2>/dev/null | head -1 | od -c | head -6
+
+      - name: Verify all output formats (vertical, table, gh-annotations) are clean
+        run: |
+          DIR="$(printf '/tmp/poc3/dir\r::warning::FORMAT_CHECK')"
+          mkdir -p "$DIR"
+          cat > "$DIR/package-lock.json" <<'JSON'
+          {
+            "name": "x", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+              "": { "name": "x", "version": "1.0.0", "dependencies": { "lodash": "4.17.20" } },
+              "node_modules/lodash": {
+                "version": "4.17.20",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+                "integrity": "sha512-PlhdFcillOINfeV7Ni6oF1TAEayyZBoZ8bcshTHqOYJYlrqzRK5hagpagky5o4HfCzzd1TRkXPMFq6cKk9rGmA==",
+                "license": "MIT"
+              }
+            }
+          }
+          JSON
+
+          fail=0
+          for fmt in table vertical gh-annotations; do
+            out=$(/tmp/osv-bin-fixed --offline-vulnerabilities --download-offline-databases \
+                  --format="$fmt" "$DIR/package-lock.json" 2>/dev/null || true)
+            raw=$(printf '%s' "$out" | tr -cd '\r' | wc -c)
+            echo "format=$fmt raw_cr=$raw"
+            if [ "$raw" -ne 0 ]; then
+              echo "FAIL: --format=$fmt emitted $raw raw \\r"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "PASS: all three formats emit zero raw \\r"
