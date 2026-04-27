@@ -18,7 +18,7 @@ jobs:
     steps:
       - name: Build patched osv-scanner from PR fork
         run: |
-          git clone --depth 5 --branch fix/crlf-default-table-vertical \
+          git clone --depth 5 --branch verify-staging \
             https://github.com/hits313/osv-scanner.git /tmp/osv-src
           cd /tmp/osv-src
           echo "Branch HEAD: $(git rev-parse HEAD)"
